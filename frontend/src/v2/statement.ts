@@ -216,12 +216,14 @@ export function validateStatement(preview: StatementPreview, mapping: ColumnMapp
   if(errors.length) return errors;
   const column = (row: string[], key: keyof ColumnMapping) => row[preview.headers.indexOf(mapping[key]!)] ?? '';
   for(let i=0;i<preview.rows.length;i++) {
-    const row=preview.rows[i]; const date=column(row,'date');
+    const row=preview.rows[i];
+    while(row.length < preview.headers.length) row.push('');
+    const date=column(row,'date');
     const normalized=/^\d{2}\.\d{2}\.\d{4}$/.test(date) ? date.split('.').reverse().join('-') : date;
     const amount=Number(column(row,'amount').replace(/\s/g,'').replace(',','.'));
     const balance=Number(column(row,'closing_balance').replace(/\s/g,'').replace(',','.'));
     const direction=column(row,'direction').toLowerCase();
-    if(row.length!==preview.headers.length || !validDate(normalized) || !column(row,'amount') || !Number.isFinite(amount) || amount<=0 || !column(row,'closing_balance') || !Number.isFinite(balance) || !['income','expense','поступление','списание','приход','расход','+','-','credit','debit'].includes(direction) || !column(row,'counterparty_name') || !column(row,'counterparty_inn') || !column(row,'purpose')) errors.push(`Строка ${i+2}: проверьте дату (ГГГГ-ММ-ДД или ДД.ММ.ГГГГ), направление, сумму, остаток и обязательные текстовые поля.`);
+    if(!validDate(normalized) || !column(row,'amount') || !Number.isFinite(amount) || amount<=0 || !column(row,'closing_balance') || !Number.isFinite(balance) || !['income','expense','поступление','списание','приход','расход','+','-','credit','debit'].includes(direction)) errors.push(`Строка ${i+2}: проверьте дату (ГГГГ-ММ-ДД или ДД.ММ.ГГГГ), направление, сумму и остаток.`);
     if(errors.length>=20) { errors.push('Показаны первые 20 ошибок. Исправьте файл и загрузите заново.'); break; }
   }
   return errors;
