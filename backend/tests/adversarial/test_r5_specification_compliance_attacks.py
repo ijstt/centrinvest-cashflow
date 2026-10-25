@@ -364,13 +364,14 @@ def test_attack_page7_fixed_costs_growth_ignores_baseline_statistical_expenses()
         )
     ]
 
-    # No manual planned events scheduled on this day
+    # The component provenance identifies the baseline as rent; total expense alone does not.
     stressed_inc, stressed_exp = ScenarioService.apply_scenario_transforms(
         future_dates=future_dates,
         base_income=base_income,
         base_expense=base_expense,
         adjustments=adj,
-        planned_events=[]
+        planned_events=[],
+        expense_components={"rent": [100000.0]}
     )
 
     # Expected correctness: 20% increase on 100,000 baseline expense yields 120,000

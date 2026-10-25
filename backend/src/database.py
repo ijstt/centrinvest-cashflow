@@ -31,3 +31,8 @@ async def get_db():
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        def upgrade_snapshots(connection):
+            from sqlalchemy import inspect
+            if 'calculation_state' not in {c['name'] for c in inspect(connection).get_columns('forecast_snapshots')}:
+                connection.exec_driver_sql('ALTER TABLE forecast_snapshots ADD COLUMN calculation_state JSON')
+        await conn.run_sync(upgrade_snapshots)

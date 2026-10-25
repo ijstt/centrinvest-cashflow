@@ -69,7 +69,10 @@ class AuthService:
         session = res.scalar_one_or_none()
         if not session:
             return None
-        if session.expires_at < datetime.now(timezone.utc):
+        expires_at = session.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < datetime.now(timezone.utc):
             await db.execute(delete(Session).where(Session.id == token))
             await db.commit()
             return None

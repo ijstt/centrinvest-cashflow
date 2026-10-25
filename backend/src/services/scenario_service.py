@@ -34,7 +34,8 @@ class ScenarioService:
         adjustments: list,
         planned_events: list = None,
         base_event_ids: list[list[str]] = None,
-        deferred_receivables: list | None = None
+        deferred_receivables: list | None = None,
+        expense_components: dict | None = None
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Pure component-based scenario transformation with exact category decomposition.
@@ -174,13 +175,10 @@ class ScenarioService:
                             for ev in day_exp_evs
                             if getattr(ev, "category_id", "") in cat_ids
                         )
-                        if day_exp_evs:
-                            if matching_cat_expense > 0:
-                                shock = matching_cat_expense * (pct / 100.0)
-                                stressed_expense[i] = round(stressed_expense[i] + shock, 2)
-                        else:
-                            shock = stressed_expense[i] * (pct / 100.0)
-                            stressed_expense[i] = round(stressed_expense[i] + shock, 2)
+                        affected = (sum(expense_components.get(category, [0.0]*horizon_days)[i]
+                                        for category in cat_ids) if expense_components is not None
+                                    else matching_cat_expense)
+                        stressed_expense[i] = round(stressed_expense[i] + affected * pct / 100.0, 2)
                     else:
                         stressed_expense[i] = round(stressed_expense[i] * (1.0 + (pct / 100.0)), 2)
 
@@ -246,7 +244,8 @@ class ScenarioService:
             base_expense=base_expense,
             adjustments=req.adjustments,
             planned_events=all_future_events,
-            base_event_ids=base_event_ids
+            base_event_ids=base_event_ids,
+            expense_components=(base_rec.calculation_state or {}).get('expense_components')
         )
 
         # Recompute balance trajectory

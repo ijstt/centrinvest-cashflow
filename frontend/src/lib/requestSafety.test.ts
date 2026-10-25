@@ -1,7 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { canEditQueryResult, createDebouncedRequest, createRequestGate, decodeStatementBytes, forecastControlValues, readForecastRequest, refreshForecastRequest, storeForecastRequest } from './requestSafety';
+import { clearWorkspaceSession, canEditQueryResult, createDebouncedRequest, createRequestGate, decodeStatementBytes, forecastControlValues, readForecastRequest, refreshForecastRequest, storeForecastRequest } from './requestSafety';
 import type { CreateForecastRequest } from '../../../contracts/types';
+
+test('auth boundary removes all financial workspace keys while preserving unrelated storage', () => {
+  const values=new Map<string,string>([
+    ['selected-company','one'],['snapshots:one','private'],['snapshots:two','private'],
+    ['forecast-requests:one','private'],['forecast-requests:two','private'],['preference','keep']
+  ]);
+  clearWorkspaceSession({get length(){return values.size;},key:index=>[...values.keys()][index]??null,removeItem:key=>{values.delete(key);}});
+  assert.deepEqual([...values],[['preference','keep']]);
+  assert.doesNotThrow(()=>clearWorkspaceSession({get length():number{throw new Error('Storage denied');},key:()=>null,removeItem:()=>{}}));
+});
 
 test('snapshot provenance roundtrips automatic balance and disabled events, isolated per company', () => {
   const values = new Map<string,string>();

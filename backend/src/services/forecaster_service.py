@@ -1,19 +1,23 @@
 import uuid
 import numpy as np
 import pandas as pd
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Literal
-from sklearn.linear_model import Ridge
+from src.services.forecast_model import predict_baseline, calibration_window
 from sqlalchemy import select, and_, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from src.models.entities import (
-    Company, DailyActualRecord, PlannedEventRecord, RecurringPatternRecord, ForecastSnapshotRecord
+    Company, DailyActualRecord, PlannedEventRecord, RecurringPatternRecord, ForecastSnapshotRecord, TransactionRecord
 )
 from src.schemas.contracts import (
     CreateForecastRequest, ForecastSnapshot, ForecastDay, CashGap, ForecastWarning,
     ForecastSummary, DataQuality, ModelId, RiskLevel
 )
-from src.services.recurring_service import add_months
+from src.services.recurring_service import add_months, RecurringService
+from src.services.forecast_components import compose_flows
+import hashlib
+import json
+from types import SimpleNamespace
 from src.services.math.fpt_solver import simulate_moving_block_bootstrap, compute_analytical_fpt
 from src.services.math.conformal import calibrate_conformal_corridor
 
@@ -97,16 +101,17 @@ class ForecasterService:
     async def create_forecast(
         db: AsyncSession,
         company_id: str,
-        req: CreateForecastRequest
+        req: CreateForecastRequest,
+        *, persist: bool = True, reusable_state: dict | None = None
     ) -> ForecastSnapshot:
         # Check company and data revision
-        comp_res = await db.execute(select(Company).where(Company.id == company_id))
+        comp_res = await db.execute(select(Company).where(Company.id == company_id).with_for_update())
         comp = comp_res.scalar_one_or_none()
         if not comp:
             raise KeyError(f"Company {company_id} not found")
 
         # Invariant: stale expected_data_revision returns 409 conflict
-        if req.expected_data_revision is not None and req.expected_data_revision >= 0 and req.expected_data_revision != comp.data_revision:
+        if req.expected_data_revision is not None and req.expected_data_revision != comp.data_revision:
             raise ValueError(f"conflict: Data revision mismatch. Expected {req.expected_data_revision}, found {comp.data_revision}")
 
         # Load daily actuals up to as_of_date
@@ -210,152 +215,55 @@ class ForecasterService:
         pred_income_base = np.zeros(horizon_days)
         pred_expense_base = np.zeros(horizon_days)
 
-        if chosen_model == "weekday_mean":
-            mean_inc = df_hist.groupby("weekday")["income"].mean().to_dict()
-            mean_exp = df_hist.groupby("weekday")["expense"].mean().to_dict()
-            overall_inc = df_hist["income"].mean()
-            overall_exp = df_hist["expense"].mean()
-            for i, d in enumerate(future_dates):
-                w = d.weekday()
-                pred_income_base[i] = mean_inc.get(w, overall_inc)
-                pred_expense_base[i] = mean_exp.get(w, overall_exp)
+        history_key = hashlib.sha256(df_hist.to_json(date_format='iso').encode()).hexdigest()
+        cache = reusable_state if (reusable_state and reusable_state.get('history_key') == history_key
+            and len(reusable_state.get('baseline_income', [])) == horizon_days) else None
+        if cache:
+            chosen_model = cache['model']
+            pred_income_base = np.array(cache['baseline_income'])
+            pred_expense_base = np.array(cache['baseline_expense'])
+        else:
+            pred_income_base, pred_expense_base = predict_baseline(df_hist, future_dates, chosen_model)
 
-        elif chosen_model == "seasonal_naive":
-            # 7-day seasonal lag from historical tail
-            last_7_inc = df_hist["income"].tail(7).values
-            last_7_exp = df_hist["expense"].tail(7).values
-            if len(last_7_inc) < 7:
-                last_7_inc = np.pad(last_7_inc, (7 - len(last_7_inc), 0), mode="edge")
-                last_7_exp = np.pad(last_7_exp, (7 - len(last_7_exp), 0), mode="edge")
-            for i in range(horizon_days):
-                pred_income_base[i] = last_7_inc[i % 7]
-                pred_expense_base[i] = last_7_exp[i % 7]
-
-        else:  # ridge_calendar
-            # Features: weekday one-hot (7), cyclical harmonics for day-of-month and month
-            def make_features(dates_series):
-                w_ohe = pd.get_dummies(dates_series.dt.day_of_week, prefix="w").reindex(columns=[f"w_{k}" for k in range(7)], fill_value=0)
-                sin_dom = np.sin(2.0 * np.pi * dates_series.dt.day / 31.0).to_frame(name="sin_dom")
-                cos_dom = np.cos(2.0 * np.pi * dates_series.dt.day / 31.0).to_frame(name="cos_dom")
-                sin_m = np.sin(2.0 * np.pi * dates_series.dt.month / 12.0).to_frame(name="sin_m")
-                cos_m = np.cos(2.0 * np.pi * dates_series.dt.month / 12.0).to_frame(name="cos_m")
-                return pd.concat([w_ohe, sin_dom, cos_dom, sin_m, cos_m], axis=1).values
-
-            X_train = make_features(df_hist["date"])
-            y_inc = df_hist["income"].values
-            y_exp = df_hist["expense"].values
-
-            model_inc = Ridge(alpha=10.0)
-            model_exp = Ridge(alpha=10.0)
-            model_inc.fit(X_train, y_inc)
-            model_exp.fit(X_train, y_exp)
-
-            future_dt_series = pd.Series(pd.to_datetime(future_dates))
-            X_future = make_features(future_dt_series)
-
-            pred_income_base = np.maximum(0.0, model_inc.predict(X_future))
-            pred_expense_base = np.maximum(0.0, model_exp.predict(X_future))
-
-        # Include planned events and recurring patterns
-        planned_event_ids_per_day: list[list[str]] = [[] for _ in range(horizon_days)]
-        recurring_inflow = np.zeros(horizon_days)
-        recurring_outflow = np.zeros(horizon_days)
-        additional_inflow = np.zeros(horizon_days)
-        additional_outflow = np.zeros(horizon_days)
-        base_recurring_inflow = np.zeros(horizon_days)
-        base_recurring_outflow = np.zeros(horizon_days)
+        # Derive patterns only from facts known at this cutoff; GET never drives forecasts.
+        tx_res = await db.execute(select(TransactionRecord).where(
+            TransactionRecord.company_id == company_id,
+            TransactionRecord.date <= as_of_d,
+            TransactionRecord.source_kind != 'sandbox'))
+        historical_transactions = list(tx_res.scalars())
         all_future_events = []
-
+        recurring_pats = []
         if req.include_planned_events:
-            start_fut = future_dates[0]
-            end_fut = future_dates[-1]
-
-            ev_res = await db.execute(
-                select(PlannedEventRecord).where(
-                    PlannedEventRecord.company_id == company_id,
-                    PlannedEventRecord.due_date >= start_fut,
-                    PlannedEventRecord.due_date <= end_fut,
-                    PlannedEventRecord.status.in_(["planned", "partial", "overdue"])
-                )
-            )
-            events = ev_res.scalars().all()
-            all_future_events = events
-
-            # Check if recurring patterns need to project future events across entire forecast horizon
-            rec_res = await db.execute(
-                select(RecurringPatternRecord).where(RecurringPatternRecord.company_id == company_id)
-            )
-            recurring_pats = rec_res.scalars().all()
-            pats_by_id = {pat.id: pat for pat in recurring_pats}
-
-            for ev in events:
-                days_idx = (ev.due_date - start_fut).days
-                if 0 <= days_idx < horizon_days:
-                    outstanding = max(0.0, float(ev.amount) - float(ev.paid_amount))
-                    is_rec = bool(ev.recurrence_id or "регулярн" in (ev.title or "").lower() or ev.kind in ["payroll", "rent", "tax"])
-                    if ev.direction == "income":
-                        if is_rec:
-                            recurring_inflow[days_idx] += outstanding
-                            if ev.recurrence_id and ev.recurrence_id in pats_by_id:
-                                base_recurring_inflow[days_idx] += float(pats_by_id[ev.recurrence_id].expected_amount)
-                            else:
-                                base_recurring_inflow[days_idx] += outstanding
-                        else:
-                            additional_inflow[days_idx] += outstanding
-                    else:
-                        if is_rec:
-                            recurring_outflow[days_idx] += outstanding
-                            if ev.recurrence_id and ev.recurrence_id in pats_by_id:
-                                base_recurring_outflow[days_idx] += float(pats_by_id[ev.recurrence_id].expected_amount)
-                            else:
-                                base_recurring_outflow[days_idx] += outstanding
-                        else:
-                            additional_outflow[days_idx] += outstanding
-                    planned_event_ids_per_day[days_idx].append(ev.id)
-
-            for pat in recurring_pats:
-                curr_target = pat.next_date
-                while curr_target <= end_fut:
-                    if curr_target >= start_fut:
-                        d_idx = (curr_target - start_fut).days
-                        if 0 <= d_idx < horizon_days:
-                            # Invariant: do not double-count if an explicit planned event for this pattern is already scheduled on this day
-                            already_scheduled = any(
-                                ev.recurrence_id == pat.id and ev.due_date == curr_target
-                                for ev in events
-                            )
-                            if not already_scheduled and pat.id not in planned_event_ids_per_day[d_idx]:
-                                if pat.direction == "income":
-                                    recurring_inflow[d_idx] += float(pat.expected_amount)
-                                    base_recurring_inflow[d_idx] += float(pat.expected_amount)
-                                else:
-                                    recurring_outflow[d_idx] += float(pat.expected_amount)
-                                    base_recurring_outflow[d_idx] += float(pat.expected_amount)
-                                planned_event_ids_per_day[d_idx].append(pat.id)
-                    # Advance to next occurrence according to cadence
-                    if "полумесячн" in pat.counterparty_name.lower() or "semi-monthly" in pat.counterparty_name.lower():
-                        curr_target = curr_target + timedelta(days=15)
-                    elif pat.cadence == "weekly":
-                        curr_target = curr_target + timedelta(days=7)
-                    elif pat.cadence == "monthly":
-                        curr_target = add_months(curr_target, 1)
-                        if "налог" in (pat.counterparty_name or "").lower() or "енп" in (pat.counterparty_name or "").lower() or pat.category_id == "taxes":
-                            from src.services.event_service import adjust_tax_due_date_art_6_1
-                            curr_target = adjust_tax_due_date_art_6_1(curr_target)
-                    else:  # quarterly
-                        curr_target = add_months(curr_target, 3)
-
-        # Final predicted daily income and expense via component-based identity replacement
-        total_pred_income, total_pred_expense = ForecasterService.combine_baseline_and_events(
-            pred_income_base=pred_income_base,
-            pred_expense_base=pred_expense_base,
-            recurring_inflow=recurring_inflow,
-            recurring_outflow=recurring_outflow,
-            additional_inflow=additional_inflow,
-            additional_outflow=additional_outflow,
-            base_recurring_inflow=base_recurring_inflow,
-            base_recurring_outflow=base_recurring_outflow
-        )
+            ev_res = await db.execute(select(PlannedEventRecord).where(
+                PlannedEventRecord.company_id == company_id,
+                PlannedEventRecord.due_date >= future_dates[0],
+                PlannedEventRecord.due_date <= future_dates[-1]))
+            all_future_events = []
+            known_receipts = {tx.id:float(tx.amount) for tx in historical_transactions}
+            for event in ev_res.scalars():
+                values = {column.name:getattr(event,column.name) for column in event.__table__.columns}
+                if event.matched_transaction_ids and event.status != 'cancelled':
+                    values['paid_amount'] = sum(known_receipts.get(key,0) for key in event.matched_transaction_ids)
+                    values['status'] = ('paid' if values['paid_amount'] >= float(event.amount) else
+                                        'partial' if values['paid_amount'] else 'planned')
+                all_future_events.append(SimpleNamespace(**values))
+            recurring_pats = await RecurringService.detect_recurring(db, company_id, as_of_d, persist=False)
+            # Preserve explicitly linked, past-only patterns (including manually curated ones).
+            linked_ids = {event.recurrence_id for event in all_future_events if event.recurrence_id}
+            if linked_ids:
+                stored = (await db.execute(select(RecurringPatternRecord).where(
+                    RecurringPatternRecord.company_id == company_id,
+                    RecurringPatternRecord.id.in_(linked_ids)))).scalars().all()
+                known_ids = {tx.id for tx in historical_transactions}
+                for pattern in stored:
+                    if not pattern.transaction_ids or set(pattern.transaction_ids) <= known_ids:
+                        recurring_pats = [p for p in recurring_pats if
+                            (p.direction,p.category_id,p.counterparty_name) !=
+                            (pattern.direction,pattern.category_id,pattern.counterparty_name)]
+                        recurring_pats.append(pattern)
+        total_pred_income, total_pred_expense, planned_event_ids_per_day, expense_components = compose_flows(
+            future_dates, pred_income_base, pred_expense_base, all_future_events,
+            recurring_pats, historical_transactions)
 
         # Compute point balance trajectory
         pred_balance = np.zeros(horizon_days)
@@ -365,6 +273,7 @@ class ForecasterService:
             pred_balance[i] = curr_b
 
         # Bootstrap simulation (7-day block bootstrap) via mathematical FPT solver
+        calibration_data = {}
         n_samples = 1000
         random_seed = 42
         w_inc_mean = df_hist.groupby("weekday")["income"].transform("mean").values
@@ -398,40 +307,13 @@ class ForecasterService:
 
             # Conformal calibration of prediction corridors using honest held-out validation slice
             if len(df_hist) >= 14:
-                n_val = min(14, max(5, len(df_hist) // 4))
-                df_tr = df_hist.iloc[:-n_val]
-                df_val = df_hist.iloc[-n_val:]
-                h_act = df_val["closing_balance"].values
-
-                # Fit baseline model on df_tr to get heldout predictions on df_val
-                if chosen_model == "weekday_mean":
-                    m_inc = df_tr.groupby("weekday")["income"].mean().to_dict()
-                    m_exp = df_tr.groupby("weekday")["expense"].mean().to_dict()
-                    ov_inc = df_tr["income"].mean()
-                    ov_exp = df_tr["expense"].mean()
-                    val_inc = np.array([m_inc.get(w, ov_inc) for w in df_val["weekday"].values])
-                    val_exp = np.array([m_exp.get(w, ov_exp) for w in df_val["weekday"].values])
-                elif chosen_model == "seasonal_naive":
-                    last7_i = df_tr["income"].tail(7).values
-                    last7_e = df_tr["expense"].tail(7).values
-                    if len(last7_i) < 7:
-                        last7_i = np.pad(last7_i, (7 - len(last7_i), 0), mode="edge")
-                        last7_e = np.pad(last7_e, (7 - len(last7_e), 0), mode="edge")
-                    val_inc = np.array([last7_i[k % 7] for k in range(n_val)])
-                    val_exp = np.array([last7_e[k % 7] for k in range(n_val)])
+                if cache and cache.get('calibration'):
+                    h_act = np.array(cache['calibration']['actual'])
+                    h_low = np.array(cache['calibration']['lower'])
+                    h_upp = np.array(cache['calibration']['upper'])
                 else:
-                    X_tr = make_features(df_tr["date"])
-                    m_inc = Ridge(alpha=10.0).fit(X_tr, df_tr["income"].values)
-                    m_exp = Ridge(alpha=10.0).fit(X_tr, df_tr["expense"].values)
-                    X_val = make_features(df_val["date"])
-                    val_inc = np.maximum(0.0, m_inc.predict(X_val))
-                    val_exp = np.maximum(0.0, m_exp.predict(X_val))
-
-                val_pred_bal = df_tr["closing_balance"].iloc[-1] + np.cumsum(val_inc - val_exp)
-                tr_res_std = np.sqrt(np.var(df_tr["income"].values) + np.var(df_tr["expense"].values))
-                val_spread = 1.28 * max(50.0, float(tr_res_std)) * np.sqrt(np.arange(1, n_val + 1))
-                h_low = val_pred_bal - val_spread
-                h_upp = val_pred_bal + val_spread
+                    window = calibration_window(df_hist, chosen_model)
+                    h_act, h_low, h_upp = (np.array(window[key]) for key in ('actual','lower','upper'))
 
                 calib = calibrate_conformal_corridor(
                     predicted_lower=np.array(lower_bounds),
@@ -442,6 +324,7 @@ class ForecasterService:
                     alpha=0.20,
                     point_predictions=pred_balance,
                 )
+                calibration_data = {'actual':h_act.tolist(), 'lower':h_low.tolist(), 'upper':h_upp.tolist()}
                 lower_bounds = [float(x) for x in calib["calibrated_lower"]]
                 upper_bounds = [float(x) for x in calib["calibrated_upper"]]
                 interval_coverage = calib["nominal_coverage"]
@@ -605,12 +488,19 @@ class ForecasterService:
             observed_days=observed_days,
             missing_days=missing_biz_days,
             duplicate_rows=0,
-            uncategorized_share=0.02,
+            uncategorized_share=(sum(t.category_id == 'uncategorized' for t in historical_transactions)
+                                 / len(historical_transactions)) if historical_transactions else 0.0,
             warnings=data_quality_warnings
         )
 
         # Save snapshot
         snapshot_rec = ForecastSnapshotRecord(
+            id=str(uuid.uuid4()), created_at=datetime.now(timezone.utc),
+            calculation_state={'request':req.model_dump(), 'history_key':history_key,
+                'balance_date':comp.balance_date.isoformat() if comp.balance_date else None,
+                'model':chosen_model, 'baseline_income':pred_income_base.tolist(),
+                'baseline_expense':pred_expense_base.tolist(), 'calibration':calibration_data,
+                'expense_components':expense_components},
             company_id=company_id,
             as_of_date=as_of_d,
             horizon_days=horizon_days,
@@ -628,9 +518,10 @@ class ForecasterService:
             warnings=[w.model_dump() for w in warnings_list],
             data_quality=data_quality.model_dump()
         )
-        db.add(snapshot_rec)
-        await db.commit()
-        await db.refresh(snapshot_rec)
+        if persist:
+            db.add(snapshot_rec)
+            await db.commit()
+            await db.refresh(snapshot_rec)
 
         return ForecastSnapshot(
             id=snapshot_rec.id,

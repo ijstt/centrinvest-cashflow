@@ -274,6 +274,11 @@ class StatementService:
                 data_revision=0
             )
 
+        # Serialize the entire company import before checking existing operation IDs.
+        comp = (await db.execute(select(Company).where(
+            Company.id == company_id).with_for_update())).scalar_one_or_none()
+        if not comp:
+            raise KeyError(f'Company {company_id} not found')
         try:
             if format_type in ("csv", "1c"):
                 text = decode_text(file_bytes)
@@ -535,7 +540,8 @@ class StatementService:
         comp_res = await db.execute(select(Company).where(Company.id == company_id).with_for_update())
         comp = comp_res.scalar_one()
 
-        comp.data_revision += 1
+        if accepted_count:
+            comp.data_revision += 1
 
         # Recompute daily actuals from all transactions (excluding sandbox)
         daily_tx_res = await db.execute(
@@ -621,7 +627,10 @@ class StatementService:
         import_rec.period_end = datetime.strptime(period_end, "%Y-%m-%d").date() if period_end else None
         import_rec.data_revision = comp.data_revision
 
-        await db.commit()
+        from src.services.financial_mutation import complete_financial_change
+        await complete_financial_change(db, company_id,
+            min(all_dates) if all_dates else (comp.balance_date or date.today()).isoformat(),
+            refresh=bool(accepted_count))
 
         return ImportResponse(
             id=import_rec.id,

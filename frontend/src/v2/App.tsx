@@ -12,7 +12,7 @@ import type { SnapshotRef } from './shared';
 import { ErrorBoundary } from './ErrorBoundary';
 import { SourceStatus } from './SourceStatus';
 import { RefreshButton } from './RefreshButton';
-import { createRequestGate, readForecastRequest, refreshForecastRequest, storeForecastRequest } from '../lib/requestSafety';
+import { clearWorkspaceSession, createRequestGate, readForecastRequest, refreshForecastRequest, storeForecastRequest } from '../lib/requestSafety';
 import './styles.css';
 
 const Legacy=lazy(()=>import('../App'));
@@ -20,6 +20,12 @@ const Overview=lazy(()=>import('./Overview')), Operations=lazy(()=>import('./Ope
 const sections=[{id:'overview',name:'Обзор финансов',icon:ChartNoAxesCombined,feature:'forecast_v2'},{id:'operations',name:'Выписки и операции',icon:FileSpreadsheet,feature:'imports'},{id:'calendar',name:'Платежный календарь',icon:CalendarDays,feature:'events'},{id:'scenarios',name:'Стресс-сценарии',icon:SlidersHorizontal,feature:'scenarios'},{id:'plan',name:'План и факт',icon:GitCompareArrows,feature:'plan_actual'},{id:'quality',name:'Качество прогноза',icon:FlaskConical,feature:'evaluation'}] as const;
 type Section=typeof sections[number]['id'];
 function storedCompany() {try{return sessionStorage.getItem('selected-company')??'';}catch{return '';}}
+function forgetWorkspace() {
+  try { clearWorkspaceSession(sessionStorage); } catch { /* Storage access may be disabled. */ }
+  const url=new URL(window.location.href);
+  url.searchParams.delete('company');url.searchParams.delete('section');
+  window.history.replaceState(window.history.state,'',url);
+}
 
 export default function App() {
   const bootstrap=useResource(async signal=>{
@@ -30,9 +36,9 @@ export default function App() {
   },[]);
   const [session,setSession]=useState<SessionResponse|null>(null), [reason,setReason]=useState(''), [logoutError,setLogoutError]=useState(''), [loggingOut,setLoggingOut]=useState(false);
   const sessionGate=useRef(createRequestGate()), logoutInFlight=useRef(false);
-  useEffect(()=>{if(bootstrap.data)setSession(bootstrap.data.session);},[bootstrap.data]);
+  useEffect(()=>{if(bootstrap.data){if(!bootstrap.data.session)forgetWorkspace();setSession(bootstrap.data.session);}},[bootstrap.data]);
   useEffect(()=>{
-    const expired=()=>{sessionGate.current.invalidate();setSession(null);setReason('Сессия завершена. Войдите, чтобы продолжить.');};
+    const expired=()=>{sessionGate.current.invalidate();forgetWorkspace();setSession(null);setReason('Сессия завершена. Войдите, чтобы продолжить.');};
     const focus=()=>{if(!session||logoutInFlight.current)return;const request=sessionGate.current.begin();void api('session',{signal:request.signal}).then(value=>{if(request.isCurrent())setSession(value);}).catch(e=>{if(request.isCurrent()&&e instanceof ApiFailure&&e.status===401)expired();});};
     window.addEventListener('session-expired',expired);window.addEventListener('focus',focus);return()=>{window.removeEventListener('session-expired',expired);window.removeEventListener('focus',focus);sessionGate.current.invalidate();};
   },[session]);
@@ -40,7 +46,7 @@ export default function App() {
   if(bootstrap.error)return <div className="boot-state"><h1>Не удалось подключиться</h1><ErrorBox message={bootstrap.error} retry={bootstrap.reload}/></div>;
   if(bootstrap.data?.capabilities===null)return <Suspense fallback={<Loading/>}><Legacy/></Suspense>;
   if(!session)return <Login reason={reason} onLogin={s=>{sessionGate.current.invalidate();setSession(s);setReason('');}}/>;
-  return <><Workspace key={session.user.id} session={session} capabilities={bootstrap.data!.capabilities!} logoutPending={loggingOut} onLogout={async()=>{logoutInFlight.current=true;sessionGate.current.invalidate();setLoggingOut(true);setLogoutError('');try{await api('logout');setSession(null);setReason('Вы вышли из рабочего пространства.');}catch(e){setLogoutError(messageOf(e));}finally{logoutInFlight.current=false;setLoggingOut(false);}}}/>{logoutError&&<div className="floating-error"><ErrorBox message={logoutError}/></div>}</>;
+  return <><Workspace key={session.user.id} session={session} capabilities={bootstrap.data!.capabilities!} logoutPending={loggingOut} onLogout={async()=>{logoutInFlight.current=true;sessionGate.current.invalidate();setLoggingOut(true);setLogoutError('');try{await api('logout');forgetWorkspace();setSession(null);setReason('Вы вышли из рабочего пространства.');}catch(e){setLogoutError(messageOf(e));}finally{logoutInFlight.current=false;setLoggingOut(false);}}}/>{logoutError&&<div className="floating-error"><ErrorBox message={logoutError}/></div>}</>;
 }
 
 function Workspace({session,capabilities,onLogout,logoutPending}:{session:SessionResponse;capabilities:CapabilitiesResponse;onLogout:()=>Promise<void>;logoutPending:boolean}) {

@@ -53,7 +53,7 @@ class ResilientLLMClient:
                     text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
                     return text
             except Exception as e:
-                logger.warning(f"Model {model} failed: {e}")
+                logger.warning("Model %s failed (%s)", model, type(e).__name__)
                 continue
         raise RuntimeError("All LLM providers unavailable")
 

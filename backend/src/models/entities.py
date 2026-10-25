@@ -163,6 +163,7 @@ class ForecastSnapshotRecord(Base):
     gaps = Column(JSON, nullable=False)
     warnings = Column(JSON, nullable=False)
     data_quality = Column(JSON, nullable=False)
+    calculation_state = Column(JSON, nullable=True)
 
 class ScenarioRecord(Base):
     __tablename__ = "scenarios"

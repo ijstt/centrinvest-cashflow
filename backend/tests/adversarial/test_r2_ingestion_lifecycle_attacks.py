@@ -569,19 +569,21 @@ class TestAttackVector5_StateMachineAndConcurrencyFailures:
             db.add(ev)
             await db.commit()
 
-            # Client passes expected_data_revision = -1 on company revision 5
-            req = EventUpdateRequest(
+            from pydantic import ValidationError
+            from src.services.event_service import RevisionMismatchError
+            values = dict(
                 title="Overwritten Event", kind="manual", direction="expense",
                 amount=99999.0, due_date="2026-02-01", category_id="rent",
                 source=SourceReference(kind="manual", label="Ручной ввод"), cancelled=False,
-                expected_data_revision=-1
+                expected_data_revision=5
             )
-            updated = await EventService.update_event(db, cid, ev.id, req, expected_data_revision=-1)
-            
-            # PROOF OF VULNERABILITY: Lock was bypassed; title updated and revision bumped to 6
-            assert updated.title == "Overwritten Event"
-            assert updated.amount == 99999.0
-            assert comp.data_revision == 6
+            with pytest.raises(ValidationError):
+                EventUpdateRequest(**{**values,'expected_data_revision':-1})
+            req = EventUpdateRequest(**values)
+            with pytest.raises(RevisionMismatchError):
+                await EventService.update_event(db, cid, ev.id, req, expected_data_revision=-1)
+            assert ev.title == 'Original Event'
+            assert comp.data_revision == 5
 
     @pytest.mark.asyncio
     async def test_attack_5_3_create_event_lacks_optimistic_revision_check(self):

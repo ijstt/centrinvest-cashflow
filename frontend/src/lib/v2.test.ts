@@ -6,6 +6,15 @@ import type {PlanActualDay} from '../../../contracts/types';
 import {readFileSync} from 'node:fs';
 
 const header='operation_id;operation_date;amount;direction;counterparty_name;counterparty_inn;payment_purpose;balance_eod';
+test('tab-delimited bank statements and quoted delimiter characters preserve column mapping',()=>{
+ const tsv=header.replaceAll(';','\t')+'\nx;2026-10-01;100;income;Client;0012345678;Payment;1000'.replaceAll(';','\t');
+ const parsed=parseStatementCsv(tsv);
+ assert.equal(parsed.headers.length,8);
+ assert.deepEqual(validateStatement(parsed,inferMapping(parsed.headers)),[]);
+ const comma=parseStatementCsv('operation_date,amount,direction,counterparty_name,counterparty_inn,"purpose;with;semicolons;inside;header",balance_eod\n2026-10-01,100,income,Client,0012345678,Payment,1000');
+ assert.equal(comma.headers.length,7);
+ assert.equal(comma.rows[0][4],'0012345678');
+});
 test('benchmark C001 statement has 1131 valid mapped operations',()=>{
  const csv=readFileSync(new URL('../../../fixtures/statements/C001_logistics.csv',import.meta.url),'utf8');
  const preview=parseStatementCsv(csv);assert.equal(preview.rows.length,1131);assert.deepEqual(validateStatement(preview,inferMapping(preview.headers)),[]);

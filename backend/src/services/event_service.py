@@ -7,6 +7,7 @@ from src.schemas.contracts import (
     ExternalEventsRequest, ExternalEventsResponse, SourceReference
 )
 from src.services.statement_service import sanitize_html_tags
+from src.services.financial_mutation import complete_financial_change
 
 # Official Russian Government weekend transfers (Постановления Правительства РФ 2024-2026)
 GOVERNMENT_TRANSFERS_HOLIDAYS = {
@@ -75,6 +76,19 @@ class RevisionMismatchError(ValueError):
         self.expected = expected
         self.actual = actual
         self.status_code = 409
+
+
+def event_response(record):
+    return PlannedEvent(
+        id=record.id, company_id=record.company_id, title=record.title, kind=record.kind,
+        direction=record.direction, amount=float(record.amount), due_date=record.due_date.isoformat(),
+        category_id=record.category_id, counterparty_name=record.counterparty_name,
+        on_time_probability=record.on_time_probability,
+        source=SourceReference(kind=record.source_kind,source_id=record.source_id,
+            external_id=record.external_id,label=record.source_label or ''),
+        status=record.status,paid_amount=float(record.paid_amount),
+        matched_transaction_ids=record.matched_transaction_ids or [],
+        recurrence_id=record.recurrence_id,updated_at=record.updated_at.isoformat())
 
 
 class EventService:
@@ -174,32 +188,10 @@ class EventService:
         )
         db.add(rec)
         comp.data_revision += 1
-        await db.commit()
+        await complete_financial_change(db, company_id, rec.due_date.isoformat())
         await db.refresh(rec)
 
-        return PlannedEvent(
-            id=rec.id,
-            company_id=rec.company_id,
-            title=rec.title,
-            kind=rec.kind,
-            direction=rec.direction,
-            amount=float(rec.amount),
-            due_date=rec.due_date.strftime("%Y-%m-%d"),
-            category_id=rec.category_id,
-            counterparty_name=rec.counterparty_name,
-            on_time_probability=rec.on_time_probability,
-            source=SourceReference(
-                kind=rec.source_kind,
-                source_id=rec.source_id,
-                external_id=rec.external_id,
-                label=rec.source_label or ""
-            ),
-            status=rec.status,
-            paid_amount=0.0,
-            matched_transaction_ids=[],
-            recurrence_id=None,
-            updated_at=rec.updated_at.isoformat()
-        )
+        return event_response(rec)
 
     @staticmethod
     async def update_event(
@@ -209,6 +201,11 @@ class EventService:
         inp: EventUpdateRequest,
         expected_data_revision: int | None = None
     ) -> PlannedEvent:
+        comp_res = await db.execute(select(Company).where(Company.id == company_id).with_for_update())
+        comp = comp_res.scalar_one_or_none()
+        if not comp:
+            raise KeyError(f"Company {company_id} not found")
+
         res = await db.execute(
             select(PlannedEventRecord).where(
                 PlannedEventRecord.company_id == company_id,
@@ -219,14 +216,9 @@ class EventService:
         if not rec:
             raise KeyError(f"Event {event_id} not found")
 
-        comp_res = await db.execute(select(Company).where(Company.id == company_id).with_for_update())
-        comp = comp_res.scalar_one_or_none()
-        if not comp:
-            raise KeyError(f"Company {company_id} not found")
-
         # Optimistic locking check
         exp_rev = expected_data_revision if expected_data_revision is not None else getattr(inp, "expected_data_revision", None)
-        if exp_rev is not None and exp_rev >= 0 and exp_rev != comp.data_revision:
+        if exp_rev is not None and exp_rev != comp.data_revision:
             raise RevisionMismatchError(
                 f"conflict: Revision mismatch. Expected {exp_rev}, found {comp.data_revision}",
                 expected=exp_rev,
@@ -250,31 +242,10 @@ class EventService:
 
         comp.data_revision += 1
 
-        await db.commit()
+        await complete_financial_change(db, company_id, rec.due_date.isoformat())
         await db.refresh(rec)
 
-        return PlannedEvent(
-            id=rec.id,
-            company_id=rec.company_id,
-            title=rec.title,
-            kind=rec.kind,
-            direction=rec.direction,
-            amount=float(rec.amount),
-            due_date=rec.due_date.strftime("%Y-%m-%d"),
-            category_id=rec.category_id,
-            counterparty_name=rec.counterparty_name,
-            source=SourceReference(
-                kind=rec.source_kind,
-                source_id=rec.source_id,
-                external_id=rec.external_id,
-                label=rec.source_label or ""
-            ),
-            status=rec.status,
-            paid_amount=float(rec.paid_amount),
-            matched_transaction_ids=rec.matched_transaction_ids or [],
-            recurrence_id=rec.recurrence_id,
-            updated_at=rec.updated_at.isoformat()
-        )
+        return event_response(rec)
 
     @staticmethod
     async def import_external_events(
@@ -450,8 +421,17 @@ class EventService:
                     updated_at=datetime.now(timezone.utc).isoformat()
                 ))
 
-        comp.data_revision += 1
-        await db.commit()
+        changed = bool(created_events or updated_count)
+        if changed:
+            comp.data_revision += 1
+        dates = [event.due_date for event in created_events]
+        await complete_financial_change(db, company_id, min(dates) if dates else
+            (comp.balance_date or date.today()).isoformat(), refresh=changed)
+        if created_events:
+            records = (await db.execute(select(PlannedEventRecord).where(
+                PlannedEventRecord.company_id == company_id,
+                PlannedEventRecord.id.in_([event.id for event in created_events])))).scalars().all()
+            created_events = [event_response(record) for record in records]
 
         return ExternalEventsResponse(
             created_events=created_events,

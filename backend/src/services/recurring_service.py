@@ -27,7 +27,8 @@ class RecurringService:
     async def detect_recurring(
         db: AsyncSession,
         company_id: str,
-        as_of_date: date | None = None
+        as_of_date: date | None = None,
+        persist: bool = True
     ) -> list[RecurringPattern]:
         # Query all transactions up to as_of_date (excluding sandbox)
         conditions = [
@@ -170,6 +171,8 @@ class RecurringService:
             )
             patterns.append(pattern)
 
+        if not persist:
+            return patterns
         # Clear old and save new patterns to db
         await db.execute(delete(RecurringPatternRecord).where(RecurringPatternRecord.company_id == company_id))
         for p in patterns:

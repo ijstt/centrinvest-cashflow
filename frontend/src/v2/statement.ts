@@ -165,8 +165,19 @@ export function parseStatementCsv(text: string): StatementPreview {
     return parse1CStatement(text);
   }
   text = text.replace(/^\uFEFF/, '');
-  const header = text.split(/\r?\n/)[0];
-  const delimiter = (header.match(/;/g)?.length ?? 0) > (header.match(/,/g)?.length ?? 0) ? ';' : ',';
+  const counts = new Map([[',',0],[';',0],['\t',0]]);
+  let inQuotes=false;
+  for(let i=0;i<text.length;i++) {
+    const char=text[i];
+    if(char==='"') {
+      if(inQuotes&&text[i+1]==='"')i++;
+      else inQuotes=!inQuotes;
+    } else if(!inQuotes) {
+      if(char==='\n'||char==='\r')break;
+      if(counts.has(char))counts.set(char,counts.get(char)!+1);
+    }
+  }
+  const delimiter=[...counts].reduce((best,candidate)=>candidate[1]>best[1]?candidate:best)[0];
   const rows: string[][] = []; let row: string[] = [], cell = '', quoted = false;
   for (let i=0; i<text.length; i++) {
     const char=text[i];

@@ -25,21 +25,7 @@ class FinancialForecaster:
         horizon_days: int = 14
     ) -> ForecastResult:
         if not history:
-            # Fallback mock forecast if history is empty
-            dates = [f"2026-11-{i:02d}" for i in range(1, horizon_days + 1)]
-            inc = [50000.0] * horizon_days
-            exp = [45000.0] * horizon_days
-            bal = [initial_balance + (5000.0 * (i + 1)) for i in range(horizon_days)]
-            return ForecastResult(
-                predicted_dates=dates,
-                predicted_income=inc,
-                predicted_expense=exp,
-                predicted_balance=bal,
-                cashflow_gap_detected=False,
-                gap_dates=[],
-                minimum_expected_balance=initial_balance,
-                risk_level="low"
-            )
+            raise ValueError('insufficient_data: Financial history is required')
 
         df = pd.DataFrame([p.model_dump() for p in history])
         df["date"] = pd.to_datetime(df["date"])

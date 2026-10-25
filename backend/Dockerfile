@@ -8,11 +8,10 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_RETRIES=5
 
 COPY pyproject.toml .
+COPY src/ ./src/
 
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir .
-
-COPY src/ ./src/
 
 EXPOSE 8000
 

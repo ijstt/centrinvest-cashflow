@@ -2,6 +2,18 @@ import type { CreateForecastRequest } from '../../../contracts/types';
 
 type StorageAccess = Pick<Storage, 'getItem' | 'setItem'>;
 const requestKey = (companyId: string) => `forecast-requests:${companyId}`;
+
+export function clearWorkspaceSession(storage: Pick<Storage, 'length' | 'key' | 'removeItem'>) {
+  try {
+    const keys = Array.from({length:storage.length}, (_, index) => storage.key(index));
+    for (const key of keys) {
+      if (key === 'selected-company' || key?.startsWith('snapshots:') || key?.startsWith('forecast-requests:')) {
+        storage.removeItem(key);
+      }
+    }
+  } catch { /* Blocked browser storage must not prevent signing out. */ }
+}
+
 export function readForecastRequest(storage: StorageAccess, companyId: string, snapshotId: string): CreateForecastRequest | null {
   try {
     const value = JSON.parse(storage.getItem(requestKey(companyId)) ?? '{}')[snapshotId];

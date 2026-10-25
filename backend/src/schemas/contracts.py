@@ -1,12 +1,19 @@
 from typing import Literal, Annotated, Union
-from pydantic import BaseModel, Field, ConfigDict
+from datetime import date
+from pydantic import BaseModel, Field, ConfigDict, AfterValidator
 from pydantic.alias_generators import to_camel
 
-LocalDate = str
+def validate_local_date(value: str) -> str:
+    parsed = date.fromisoformat(value)
+    if parsed.isoformat() != value:
+        raise ValueError('Expected a calendar date in YYYY-MM-DD format')
+    return value
+
+LocalDate = Annotated[str, AfterValidator(validate_local_date)]
 UtcTimestamp = str
 EntityId = str
-Money = float
-Probability = float
+Money = Annotated[float, Field(allow_inf_nan=False)]
+Probability = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 Direction = Literal["income", "expense"]
 RiskLevel = Literal["low", "medium", "critical"]
 Currency = Literal["RUB"]
@@ -21,8 +28,8 @@ class TransactionPoint(BaseModel):
 class ForecastRequest(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True, alias_generator=to_camel)
     initial_balance: Money = 150000.0
-    horizon_days: int = 14
-    history: list[TransactionPoint] = []
+    horizon_days: int = Field(default=14, ge=1, le=90)
+    history: list[TransactionPoint] = Field(min_length=1)
 
 class ForecastResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -267,7 +274,7 @@ class PlannedEventInput(BaseModel):
     title: str
     kind: EventKind
     direction: Direction
-    amount: Money
+    amount: Money = Field(gt=0)
     due_date: LocalDate
     category_id: CategoryId
     counterparty_name: str | None = None
@@ -294,7 +301,7 @@ class EventListResponse(BaseModel):
 
 class EventUpdateRequest(PlannedEventInput):
     cancelled: bool = False
-    expected_data_revision: int | None = None
+    expected_data_revision: int | None = Field(default=None, ge=0)
 
 class InvoiceInput(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -302,7 +309,7 @@ class InvoiceInput(BaseModel):
     number: str
     issued_date: LocalDate
     due_date: LocalDate
-    amount: Money
+    amount: Money = Field(gt=0)
     direction: Direction
     counterparty_name: str
     category_id: CategoryId
@@ -311,7 +318,7 @@ class InvoiceInput(BaseModel):
 class ContractScheduleItem(BaseModel):
     model_config = ConfigDict(extra="ignore")
     due_date: LocalDate
-    amount: Money
+    amount: Money = Field(gt=0)
     on_time_probability: Probability | None = None
 
 class ContractInput(BaseModel):
@@ -330,7 +337,7 @@ class TaxPaymentInput(BaseModel):
     external_id: str
     title: str
     due_date: LocalDate
-    amount: Money
+    amount: Money = Field(gt=0)
     period: str
     authority_source_url: str | None = None
     confirmed_by_user: bool = True
@@ -358,7 +365,7 @@ class CreateForecastRequest(BaseModel):
     initial_balance: Money | None = None
     include_planned_events: bool = True
     model: Literal["seasonal_naive", "weekday_mean", "ridge_calendar", "auto"] = "auto"
-    expected_data_revision: int = 0
+    expected_data_revision: int = Field(default=0, ge=0)
 
 class ForecastDay(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -443,7 +450,7 @@ class ForecastSnapshot(BaseModel):
 class ForecastUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True, alias_generator=to_camel)
     changed_from_date: LocalDate
-    expected_data_revision: int
+    expected_data_revision: int = Field(ge=0)
 
 class ForecastUpdateResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -465,7 +472,7 @@ class RevenueDropScenario(BaseModel):
 
 class ExtraExpenseScenario(BaseModel):
     kind: Literal["extra_expense"] = "extra_expense"
-    amount: Money
+    amount: Money = Field(gt=0)
     date: LocalDate
     category_id: CategoryId
 
@@ -528,7 +535,7 @@ class EvaluationRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     training_end_date: LocalDate
     test_days: Literal[30, 60, 90] = 30
-    folds: int = 3
+    folds: int = Field(default=3, ge=1, le=5)
     models: list[ModelId] = ["seasonal_naive", "weekday_mean", "ridge_calendar"]
 
 class ModelMetrics(BaseModel):

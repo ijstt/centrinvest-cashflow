@@ -33,7 +33,7 @@ The platform implements an **Accounting-Informed Machine Learning (AIML)** archi
 4. **Stochastic Liquidity Risk & First Passage Time**:
    - **7-day Moving Block Bootstrap (1,000 iterations)**: Preserves intra-week error autocorrelation.
    - **First Passage Time Ruin Probability**: $P(\\tau \le t) = P(\\exists s \le t: B_s < 0)$.
-   - **Split-Conformal Prediction**: Distribution-free 80% confidence corridors with proven finite-sample validity (Angelopoulos & Bates, 2023).
+   - **Split-Conformal Prediction**: Nominal 80% corridors calibrated on held-out past observations. Independent temporal backtests report empirical coverage.
 
 5. **Starred Capabilities (*Задачи со звездочкой*)**:
    - **Multi-Tenant Profile**: Multi-company workspace switching per user with complete ledger isolation.
@@ -132,7 +132,7 @@ npm run dev
 
 ## Verification & Test Suite
 
-The platform includes a 100% automated test suite with **151 backend tests** and **29 frontend tests** (180 total tests):
+The verification suite includes **170 backend tests** and **31 frontend tests**, with backend acceptance also verified against an isolated PostgreSQL instance. See [release remediation](docs/RELEASE_REMEDIATION_20261025.md) for behavior, evidence and limitations.
 
 ```bash
 # Run entire test suite (backend + frontend)

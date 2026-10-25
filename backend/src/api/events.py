@@ -19,7 +19,7 @@ async def list_recurring(
     user: User = Depends(verify_company_access),
     db: AsyncSession = Depends(get_db)
 ):
-    patterns = await RecurringService.detect_recurring(db, company_id)
+    patterns = await RecurringService.detect_recurring(db, company_id, persist=False)
     return RecurringListResponse(items=patterns)
 
 @router.get("/events", response_model=EventListResponse)
@@ -59,7 +59,7 @@ async def update_event(
     company_id: str,
     event_id: str,
     req: EventUpdateRequest,
-    expected_data_revision: int | None = Query(None),
+    expected_data_revision: int | None = Query(None, ge=0),
     user: User = Depends(verify_company_access),
     db: AsyncSession = Depends(get_db)
 ):

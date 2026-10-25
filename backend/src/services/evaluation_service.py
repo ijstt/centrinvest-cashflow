@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, date, timedelta
 from typing import Literal
-from sklearn.linear_model import Ridge
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from src.models.entities import Company, DailyActualRecord, EvaluationRecord
@@ -21,7 +20,7 @@ class EvaluationService:
         company_id: str,
         req: EvaluationRequest
     ) -> EvaluationResponse:
-        comp_res = await db.execute(select(Company).where(Company.id == company_id))
+        comp_res = await db.execute(select(Company).where(Company.id == company_id).with_for_update())
         comp = comp_res.scalar_one_or_none()
         if not comp:
             raise KeyError(f"Company {company_id} not found")
@@ -117,63 +116,16 @@ class EvaluationService:
             true_bal_traj = np.where(np.isnan(act_bal), init_bal + np.cumsum(act_inc - act_exp), act_bal)
 
             for m in models_to_test:
-                pred_inc = np.zeros(H)
-                pred_exp = np.zeros(H)
-                sigma_daily = 1000.0
-
-                if m == "weekday_mean":
-                    w_inc = df_train.groupby("weekday")["income"].mean().to_dict()
-                    w_exp = df_train.groupby("weekday")["expense"].mean().to_dict()
-                    mean_inc = df_train["income"].mean()
-                    mean_exp = df_train["expense"].mean()
-                    for i, w in enumerate(df_test["weekday"].values):
-                        pred_inc[i] = w_inc.get(w, mean_inc)
-                        pred_exp[i] = w_exp.get(w, mean_exp)
-                    w_inc_tr = df_train.groupby("weekday")["income"].transform("mean").values
-                    w_exp_tr = df_train.groupby("weekday")["expense"].transform("mean").values
-                    tr_flow_err = (df_train["income"].values - w_inc_tr) - (df_train["expense"].values - w_exp_tr)
-                    sigma_daily = float(np.std(tr_flow_err)) if len(tr_flow_err) > 1 else 1000.0
-
-                elif m == "seasonal_naive":
-                    last_7_inc = df_train["income"].tail(7).values
-                    last_7_exp = df_train["expense"].tail(7).values
-                    if len(last_7_inc) < 7:
-                        last_7_inc = np.pad(last_7_inc, (7 - len(last_7_inc), 0), mode="edge")
-                        last_7_exp = np.pad(last_7_exp, (7 - len(last_7_exp), 0), mode="edge")
-                    for i in range(H):
-                        pred_inc[i] = last_7_inc[i % 7]
-                        pred_exp[i] = last_7_exp[i % 7]
-                    net_train = df_train["income"].values - df_train["expense"].values
-                    if len(net_train) > 7:
-                        tr_flow_err = net_train[7:] - net_train[:-7]
-                    else:
-                        tr_flow_err = net_train - np.mean(net_train)
-                    sigma_daily = float(np.std(tr_flow_err)) if len(tr_flow_err) > 1 else 1000.0
-
-                else:  # ridge_calendar
-                    def make_feats(dates_s):
-                        w_ohe = pd.get_dummies(dates_s.dt.day_of_week, prefix="w").reindex(columns=[f"w_{k}" for k in range(7)], fill_value=0)
-                        sin_dom = np.sin(2.0 * np.pi * dates_s.dt.day / 31.0).to_frame(name="sin_dom")
-                        cos_dom = np.cos(2.0 * np.pi * dates_s.dt.day / 31.0).to_frame(name="cos_dom")
-                        sin_m = np.sin(2.0 * np.pi * dates_s.dt.month / 12.0).to_frame(name="sin_m")
-                        cos_m = np.cos(2.0 * np.pi * dates_s.dt.month / 12.0).to_frame(name="cos_m")
-                        return pd.concat([w_ohe, sin_dom, cos_dom, sin_m, cos_m], axis=1).values
-
-                    X_tr = make_feats(df_train["date"])
-                    y_tr_inc = df_train["income"].values
-                    y_tr_exp = df_train["expense"].values
-
-                    r_inc = Ridge(alpha=10.0).fit(X_tr, y_tr_inc)
-                    r_exp = Ridge(alpha=10.0).fit(X_tr, y_tr_exp)
-
-                    X_te = make_feats(df_test["date"])
-                    pred_inc = np.maximum(0.0, r_inc.predict(X_te))
-                    pred_exp = np.maximum(0.0, r_exp.predict(X_te))
-                    tr_flow_err = (y_tr_inc - r_inc.predict(X_tr)) - (y_tr_exp - r_exp.predict(X_tr))
-                    sigma_daily = float(np.std(tr_flow_err)) if len(tr_flow_err) > 1 else 1000.0
-
-                sigma_daily = max(sigma_daily, 50.0)
-                pred_bal = init_bal + np.cumsum(pred_inc - pred_exp)
+                # Evaluate exactly the runtime model and uncertainty pipeline on past-only inputs.
+                from src.services.forecaster_service import ForecasterService
+                from src.schemas.contracts import CreateForecastRequest
+                snapshot = await ForecasterService.create_forecast(db, company_id,
+                    CreateForecastRequest(as_of_date=fold.train_end, horizon_days=test_days,
+                        initial_balance=None, include_planned_events=False, model=m,
+                        expected_data_revision=comp.data_revision), persist=False)
+                pred_inc = np.array([day.predicted_income for day in snapshot.days])
+                pred_exp = np.array([day.predicted_expense for day in snapshot.days])
+                pred_bal = np.array([day.predicted_balance for day in snapshot.days])
 
                 obs_mask = (df_test["observation"] != "missing").values
                 if not np.any(obs_mask):
@@ -197,13 +149,13 @@ class EvaluationService:
                     if not obs_mask[i]:
                         continue
                     step_t = i + 1
-                    sigma_bal = sigma_daily * math.sqrt(step_t)
-                    bal_lower = pred_bal[i] - 1.28155 * sigma_bal
-                    bal_upper = pred_bal[i] + 1.28155 * sigma_bal
-                    if bal_lower <= true_bal_traj[i] <= bal_upper:
-                        res["coverage_hits"] += 1
-
-                    prob_gap = min(1.0, 2.0 * norm_cdf((0.0 - pred_bal[i]) / sigma_bal))
+                    forecast_day = snapshot.days[i]
+                    bal_lower, bal_upper = forecast_day.balance_lower, forecast_day.balance_upper
+                    if bal_lower is not None and bal_lower <= true_bal_traj[i] <= bal_upper:
+                        res['coverage_hits'] += 1
+                    prob_gap = forecast_day.gap_probability
+                    if prob_gap is None:
+                        raise ValueError('unavailable: Runtime risk estimate is unavailable')
                     actual_gap = true_bal_traj[i] < 0
                     actual_binary = 1.0 if actual_gap else 0.0
                     res["brier_sum"] += (prob_gap - actual_binary) ** 2

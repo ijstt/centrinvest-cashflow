@@ -6,6 +6,21 @@ from src.schemas.contracts import (
     PlanActualResponse, PlanActualDay, PlannedEvent, SourceReference
 )
 
+
+async def refresh_latest_forecast(db, company_id, changed_from_date):
+    previous = (await db.execute(select(ForecastSnapshotRecord).where(
+        ForecastSnapshotRecord.company_id == company_id
+    ).order_by(ForecastSnapshotRecord.created_at.desc(), ForecastSnapshotRecord.id.desc()).limit(1))).scalar_one_or_none()
+    company = await db.get(Company, company_id)
+    if previous is None or previous.data_revision == company.data_revision:
+        return None
+    from src.services.incremental_service import IncrementalService
+    from src.schemas.contracts import ForecastUpdateRequest
+    result = await IncrementalService.update_forecast(db, company_id, previous.id,
+        ForecastUpdateRequest(changed_from_date=changed_from_date,
+                              expected_data_revision=company.data_revision))
+    return result.forecast.id
+
 class ReconciliationService:
     @staticmethod
     async def get_plan_actual(
@@ -154,10 +169,14 @@ class ReconciliationService:
                 ))
             days = weekly_days
 
+        latest = (await db.execute(select(ForecastSnapshotRecord).where(
+            ForecastSnapshotRecord.company_id == company_id,
+            ForecastSnapshotRecord.data_revision == comp.data_revision
+        ).order_by(ForecastSnapshotRecord.created_at.desc()).limit(1))).scalar_one_or_none()
         return PlanActualResponse(
             forecast_id=forecast_id,
             data_revision=comp.data_revision,
             days=days,
             overdue_events=overdue_events,
-            updated_forecast_id=None
+            updated_forecast_id=latest.id if latest and latest.id != snap.id else None
         )

@@ -42,8 +42,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "backend"))
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import Ridge
-from scipy.special import ndtr
+from src.services.forecast_model import predict_baseline, calibration_window
 
 from src.services.statement_service import (
     decode_text, is_1c_file, parse_1c_exchange, parse_decimal, parse_direction,
@@ -320,56 +319,23 @@ def run_control_audit(file_path: str, horizon_days: int = 30, initial_balance_ov
             act_inc = df_te["income"].values
             act_exp = df_te["expense"].values
             act_bal = df_te["closing_balance"].values
-            true_bal_traj = init_b + np.cumsum(act_inc - act_exp)
+            true_bal_traj = np.where(np.isfinite(act_bal),act_bal,init_b + np.cumsum(act_inc-act_exp))
 
-            pred_inc = np.zeros(H)
-            pred_exp = np.zeros(H)
-
-            if m == "weekday_mean":
-                w_inc = df_tr.groupby("weekday")["income"].mean().to_dict()
-                w_exp = df_tr.groupby("weekday")["expense"].mean().to_dict()
-                m_inc = float(df_tr["income"].mean())
-                m_exp = float(df_tr["expense"].mean())
-                for i, w in enumerate(df_te["weekday"].values):
-                    pred_inc[i] = w_inc.get(w, m_inc)
-                    pred_exp[i] = w_exp.get(w, m_exp)
-                tr_flow_err = (df_tr["income"].values - df_tr.groupby("weekday")["income"].transform("mean").values) - \
-                              (df_tr["expense"].values - df_tr.groupby("weekday")["expense"].transform("mean").values)
-                sigma_daily = float(np.std(tr_flow_err)) if len(tr_flow_err) > 1 else 1000.0
-
-            elif m == "seasonal_naive":
-                last_7_i = df_tr["income"].tail(7).values
-                last_7_e = df_tr["expense"].tail(7).values
-                if len(last_7_i) < 7:
-                    last_7_i = np.pad(last_7_i, (7 - len(last_7_i), 0), mode="edge")
-                    last_7_e = np.pad(last_7_e, (7 - len(last_7_e), 0), mode="edge")
-                for i in range(H):
-                    pred_inc[i] = last_7_i[i % 7]
-                    pred_exp[i] = last_7_e[i % 7]
-                net_tr = df_tr["income"].values - df_tr["expense"].values
-                tr_flow_err = net_tr[7:] - net_tr[:-7] if len(net_tr) > 7 else net_tr - np.mean(net_tr)
-                sigma_daily = float(np.std(tr_flow_err)) if len(tr_flow_err) > 1 else 1000.0
-
-            else:  # ridge_calendar
-                def make_f(dates_s):
-                    w_ohe = pd.get_dummies(dates_s.dt.day_of_week, prefix="w").reindex(columns=[f"w_{k}" for k in range(7)], fill_value=0)
-                    sin_dom = np.sin(2.0 * np.pi * dates_s.dt.day / 31.0).to_frame(name="sin_dom")
-                    cos_dom = np.cos(2.0 * np.pi * dates_s.dt.day / 31.0).to_frame(name="cos_dom")
-                    sin_m = np.sin(2.0 * np.pi * dates_s.dt.month / 12.0).to_frame(name="sin_m")
-                    cos_m = np.cos(2.0 * np.pi * dates_s.dt.month / 12.0).to_frame(name="cos_m")
-                    return pd.concat([w_ohe, sin_dom, cos_dom, sin_m, cos_m], axis=1).values
-
-                X_tr = make_f(df_tr["date"])
-                r_inc = Ridge(alpha=10.0).fit(X_tr, df_tr["income"].values)
-                r_exp = Ridge(alpha=10.0).fit(X_tr, df_tr["expense"].values)
-                X_te = make_f(df_te["date"])
-                pred_inc = np.maximum(0.0, r_inc.predict(X_te))
-                pred_exp = np.maximum(0.0, r_exp.predict(X_te))
-                tr_flow_err = (df_tr["income"].values - r_inc.predict(X_tr)) - (df_tr["expense"].values - r_exp.predict(X_tr))
-                sigma_daily = float(np.std(tr_flow_err)) if len(tr_flow_err) > 1 else 1000.0
-
-            sigma_daily = max(sigma_daily, 50.0)
-            pred_bal = init_b + np.cumsum(pred_inc - pred_exp)
+            pred_inc, pred_exp = predict_baseline(df_tr, df_te['date'], m)
+            pred_inc, pred_exp = np.round(pred_inc,2), np.round(pred_exp,2)
+            pred_bal = np.round(init_b + np.cumsum(pred_inc-pred_exp),2)
+            simulation = simulate_moving_block_bootstrap(initial_balance=init_b,
+                pred_income=pred_inc,pred_expense=pred_exp,
+                res_income=df_tr['income'].values-df_tr.groupby('weekday')['income'].transform('mean').values,
+                res_expense=df_tr['expense'].values-df_tr.groupby('weekday')['expense'].transform('mean').values,
+                n_samples=1000,block_len=7,seed=42,
+                forecast_start_weekday=int(df_te['weekday'].iloc[0]),
+                history_start_weekday=int(df_tr['weekday'].iloc[0]))
+            window = calibration_window(df_tr,m)
+            corridor = calibrate_conformal_corridor(predicted_lower=simulation['lower_bounds'],
+                predicted_upper=simulation['upper_bounds'],historical_actual=np.array(window['actual']),
+                historical_lower=np.array(window['lower']),historical_upper=np.array(window['upper']),
+                alpha=0.20,point_predictions=pred_bal)
 
             i_err = np.abs(act_inc - pred_inc)
             e_err = np.abs(act_exp - pred_exp)
@@ -388,14 +354,9 @@ def run_control_audit(file_path: str, horizon_days: int = 30, initial_balance_ov
             total_eval_days += H
 
             for i in range(H):
-                step_t = i + 1
-                sigma_bal = sigma_daily * math.sqrt(step_t)
-                b_low = pred_bal[i] - 1.28155 * sigma_bal
-                b_upp = pred_bal[i] + 1.28155 * sigma_bal
-                if b_low <= true_bal_traj[i] <= b_upp:
+                if corridor['calibrated_lower'][i] <= true_bal_traj[i] <= corridor['calibrated_upper'][i]:
                     cov_hits += 1
-
-                p_gap = float(min(1.0, 2.0 * ndtr((0.0 - pred_bal[i]) / sigma_bal)))
+                p_gap = float(simulation['daily_gap_probabilities'][i])
                 act_gap = bool(true_bal_traj[i] < 0)
                 pred_gap = bool(pred_bal[i] < 0)
                 brier_sum += (p_gap - (1.0 if act_gap else 0.0)) ** 2
@@ -463,39 +424,11 @@ def run_control_audit(file_path: str, horizon_days: int = 30, initial_balance_ov
     curr_balance = float(df_daily["closing_balance"].iloc[-1])
     future_dates = [last_hist_date + timedelta(days=d) for d in range(1, horizon_days + 1)]
 
-    # Compute champion forward point predictions
-    f_inc = np.zeros(horizon_days)
-    f_exp = np.zeros(horizon_days)
-    if best_model == "weekday_mean":
-        w_i = df_daily.groupby("weekday")["income"].mean().to_dict()
-        w_e = df_daily.groupby("weekday")["expense"].mean().to_dict()
-        for idx, dt in enumerate(future_dates):
-            w = dt.weekday()
-            f_inc[idx] = w_i.get(w, df_daily["income"].mean())
-            f_exp[idx] = w_e.get(w, df_daily["expense"].mean())
-    elif best_model == "seasonal_naive":
-        last7_i = df_daily["income"].tail(7).values
-        last7_e = df_daily["expense"].tail(7).values
-        for idx in range(horizon_days):
-            f_inc[idx] = last7_i[idx % 7]
-            f_exp[idx] = last7_e[idx % 7]
-    else:
-        def make_f(dates_s):
-            w_ohe = pd.get_dummies(dates_s.dt.day_of_week, prefix="w").reindex(columns=[f"w_{k}" for k in range(7)], fill_value=0)
-            sin_dom = np.sin(2.0 * np.pi * dates_s.dt.day / 31.0).to_frame(name="sin_dom")
-            cos_dom = np.cos(2.0 * np.pi * dates_s.dt.day / 31.0).to_frame(name="cos_dom")
-            sin_m = np.sin(2.0 * np.pi * dates_s.dt.month / 12.0).to_frame(name="sin_m")
-            cos_m = np.cos(2.0 * np.pi * dates_s.dt.month / 12.0).to_frame(name="cos_m")
-            return pd.concat([w_ohe, sin_dom, cos_dom, sin_m, cos_m], axis=1).values
+    # Same statistical model as the runtime, fitted on the available history only.
+    f_inc, f_exp = predict_baseline(df_daily, future_dates, best_model)
 
-        X_all = make_f(df_daily["date"])
-        r_i = Ridge(alpha=10.0).fit(X_all, df_daily["income"].values)
-        r_e = Ridge(alpha=10.0).fit(X_all, df_daily["expense"].values)
-        X_fut = make_f(pd.Series(future_dates))
-        f_inc = np.maximum(0.0, r_i.predict(X_fut))
-        f_exp = np.maximum(0.0, r_e.predict(X_fut))
-
-    f_balance = curr_balance + np.cumsum(f_inc - f_exp)
+    f_inc, f_exp = np.round(f_inc,2), np.round(f_exp,2)
+    f_balance = np.round(curr_balance + np.cumsum(f_inc - f_exp),2)
 
     # 7-day Moving Block Bootstrap simulation
     w_inc_tr = df_daily.groupby("weekday")["income"].transform("mean").values
@@ -526,14 +459,14 @@ def run_control_audit(file_path: str, horizon_days: int = 30, initial_balance_ov
     cum_ruin_p = sim_res["cumulative_gap_probability"]
 
     # Conformal calibration on validation holdout
-    n_val = min(14, max(5, len(df_daily) // 4))
-    h_act = df_daily["closing_balance"].tail(n_val).values
+    window = calibration_window(df_daily, best_model)
+    h_act, h_low, h_upp = (np.array(window[key]) for key in ('actual','lower','upper'))
     calib = calibrate_conformal_corridor(
         predicted_lower=np.array(b_low_mbb),
         predicted_upper=np.array(b_upp_mbb),
         historical_actual=h_act,
-        historical_lower=h_act - 1000.0,
-        historical_upper=h_act + 1000.0,
+        historical_lower=h_low,
+        historical_upper=h_upp,
         alpha=0.20,
         point_predictions=f_balance
     )
@@ -543,13 +476,15 @@ def run_control_audit(file_path: str, horizon_days: int = 30, initial_balance_ov
     # Gap detection
     gap_days = []
     for i, b in enumerate(f_balance):
-        if b < 0 or (daily_ruin_p[i] is not None and daily_ruin_p[i] > 0.20):
+        if b < 0 or (daily_ruin_p[i] is not None and daily_ruin_p[i] > 0.15):
             gap_days.append(i)
 
     has_gap = len(gap_days) > 0
     first_gap_date = future_dates[gap_days[0]].strftime("%Y-%m-%d") if has_gap else None
     min_bal = float(np.min(f_balance))
-    max_deficit = abs(min_bal) if min_bal < 0 else 0.0
+    negative_trajectories = trajectories[trajectories < 0]
+    max_deficit = (abs(min_bal) if min_bal < 0 else
+                   float(abs(np.percentile(negative_trajectories,10))) if has_gap and len(negative_trajectories) else 0.0)
 
     log_step(6, total_steps, "Forward Trajectory, Conformal Corridor & Cash Gap Audit", [
         f"Forecast horizon: {horizon_days} calendar days ({future_dates[0].strftime('%Y-%m-%d')} to {future_dates[-1].strftime('%Y-%m-%d')})",
@@ -607,7 +542,7 @@ def run_control_audit(file_path: str, horizon_days: int = 30, initial_balance_ov
     print("-" * 96)
     for i in range(min(10, horizon_days)):
         dt_str = future_dates[i].strftime("%Y-%m-%d")
-        status = "GAP RISK" if (f_balance[i] < 0 or daily_ruin_p[i] > 0.20) else "OK"
+        status = "GAP RISK" if (f_balance[i] < 0 or daily_ruin_p[i] > 0.15) else "OK"
         print(
             f"{dt_str:<11} | "
             f"{f_inc[i]:>9,.0f} ₽ | "
@@ -652,7 +587,7 @@ def run_control_audit(file_path: str, horizon_days: int = 30, initial_balance_ov
     return out_dict
 
 
-def upload_to_api(file_path: str, api_url: str):
+def upload_to_api(file_path: str, api_url: str, upload_mapping: dict | None = None):
     import httpx
     print(f"\n[LIVE API SYNC] Syncing dataset to live platform: {api_url} ...")
     clean_url = api_url.rstrip("/")
@@ -734,6 +669,8 @@ def upload_to_api(file_path: str, api_url: str):
 
 
 if __name__ == "__main__":
+    if os.name == 'nt':
+        sys.stdout.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser(description="Bank Center-invest Control Dataset Evaluator")
     parser.add_argument("--file", "-f", required=True, help="Path to control dataset (CSV, XLSX, or 1CClientBankExchange)")
     parser.add_argument("--horizon", "-H", type=int, default=30, choices=[30, 60, 90], help="Forecast horizon (days)")
